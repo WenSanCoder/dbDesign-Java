@@ -4,6 +4,10 @@ server:
 spring:
   application:
     name: edu-system-backend
+  servlet:
+    multipart:
+      max-file-size: 2MB
+      max-request-size: 2MB
   datasource:
     driver-class-name: com.zjut.edusystem.config.OpenGaussAliasDriver
     url: ${DB_URL:jdbc:opengauss://x6.sjcmc.cn:34003/postgres?user=sht&password=@Sht20051229}
@@ -19,6 +23,14 @@ mybatis-plus:
     map-underscore-to-camel-case: true
 
 edu-system:
+  upload:
+    image-dir: ${IMAGE_UPLOAD_DIR:uploads/image}
+    public-base-url: ${PUBLIC_BASE_URL:http://x6.sjcmc.cn:34084}
+    remote:
+      enabled: ${REMOTE_UPLOAD_ENABLED:true}
+      upload-url: ${REMOTE_UPLOAD_URL:http://x6.sjcmc.cn:34084/image-upload/}
+      username: ${REMOTE_UPLOAD_USER:}
+      password: ${REMOTE_UPLOAD_PASSWORD:}
   cors:
     allowed-origins:
       - http://localhost:5173
