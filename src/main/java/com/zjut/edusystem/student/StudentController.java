@@ -27,13 +27,37 @@ public class StudentController {
     }
 
     @GetMapping("/{studentId}/schedule")
-    public ApiResponse<List<Map<String, Object>>> mySchedule(@PathVariable Long studentId) {
-        return ApiResponse.ok(selectionService.mySchedule(studentId));
+    public ApiResponse<List<Map<String, Object>>> mySchedule(
+            @PathVariable Long studentId,
+            @RequestParam(required = false) String academicYear,
+            @RequestParam(required = false) Integer semester
+    ) {
+        return ApiResponse.ok(selectionService.mySchedule(studentId, academicYear, semester));
     }
 
     @GetMapping("/{studentId}/grades")
-    public ApiResponse<List<Map<String, Object>>> myGrades(@PathVariable Long studentId) {
-        return ApiResponse.ok(selectionService.myGrades(studentId));
+    public ApiResponse<List<Map<String, Object>>> myGrades(
+            @PathVariable Long studentId,
+            @RequestParam(required = false) String academicYear,
+            @RequestParam(required = false) Integer semester,
+            @RequestParam(required = false) Long courseId,
+            @RequestParam(required = false) String courseType
+    ) {
+        return ApiResponse.ok(selectionService.myGrades(studentId, academicYear, semester, courseId, courseType));
+    }
+
+    @GetMapping("/{studentId}/training-plan")
+    public ApiResponse<List<Map<String, Object>>> myTrainingPlan(
+            @PathVariable Long studentId,
+            @RequestParam(required = false) String academicYear,
+            @RequestParam(required = false) Integer semester
+    ) {
+        return ApiResponse.ok(selectionService.myTrainingPlan(studentId, academicYear, semester));
+    }
+
+    @GetMapping("/{studentId}/training-plan/terms")
+    public ApiResponse<List<Map<String, Object>>> myTrainingPlanTerms(@PathVariable Long studentId) {
+        return ApiResponse.ok(selectionService.myTrainingPlanTerms(studentId));
     }
 
     @GetMapping("/{studentId}/waitlist")

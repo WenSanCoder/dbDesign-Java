@@ -16,8 +16,12 @@ public class TeacherController {
     }
 
     @GetMapping("/{teacherId}/classes")
-    public ApiResponse<List<Map<String, Object>>> classes(@PathVariable Long teacherId) {
-        return ApiResponse.ok(teacherService.classes(teacherId));
+    public ApiResponse<List<Map<String, Object>>> classes(
+            @PathVariable Long teacherId,
+            @RequestParam(required = false) String academicYear,
+            @RequestParam(required = false) Integer semester
+    ) {
+        return ApiResponse.ok(teacherService.classes(teacherId, academicYear, semester));
     }
 
     @GetMapping("/{teacherId}/classes/{teachingClassId}/students")
