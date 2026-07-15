@@ -26,7 +26,18 @@ public class DashboardController {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("term", queryOne("SELECT * FROM term WHERE is_current = TRUE LIMIT 1", Map.of()));
         data.put("notices", queryList("SELECT * FROM notice ORDER BY created_at DESC LIMIT 6", Map.of()));
-        data.put("round", queryOne("SELECT * FROM course_selection_round ORDER BY round_id DESC LIMIT 1", Map.of()));
+        data.put("round", queryOne("""
+                SELECT csr.round_id, csr.term_id, csr.round_name, csr.start_time, csr.end_time, csr.waitlist_enabled,
+                       CASE
+                         WHEN csr.status = 'closed' THEN 'closed'
+                         WHEN CURRENT_TIMESTAMP < csr.start_time THEN 'not_started'
+                         WHEN CURRENT_TIMESTAMP <= csr.end_time THEN 'open'
+                         ELSE 'ended'
+                       END AS status
+                FROM course_selection_round csr
+                ORDER BY csr.round_id DESC
+                LIMIT 1
+                """, Map.of()));
         data.put("contact_phone", queryOne("SELECT contact_phone FROM college ORDER BY college_id LIMIT 1", Map.of()).get("contact_phone"));
         return ApiResponse.ok(data);
     }
@@ -47,7 +58,11 @@ public class DashboardController {
                 SELECT
                   (SELECT COUNT(*) FROM student_course_selection WHERE student_id = :studentId AND status = 'selected') AS selected_count,
                   (SELECT COUNT(*) FROM selection_waitlist WHERE student_id = :studentId AND status = 'waiting') AS waitlist_count,
-                  (SELECT COUNT(*) FROM grade_record WHERE student_id = :studentId AND submitted = TRUE) AS grade_count
+                  (SELECT COUNT(*) FROM grade_record gr
+                   WHERE gr.student_id = :studentId AND gr.submitted = TRUE
+                     AND EXISTS (SELECT 1 FROM sht_grade_workflow_batches13 approved_batch
+                                 WHERE approved_batch.lr_teaching_class_id13 = gr.teaching_class_id
+                                   AND approved_batch.lr_status13 = 'approved')) AS grade_count
                 """, Map.of("studentId", studentId)));
         data.put("notices", queryList("SELECT * FROM notice ORDER BY created_at DESC LIMIT 6", Map.of()));
         return ApiResponse.ok(data);

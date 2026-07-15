@@ -14,6 +14,13 @@ spring:
     hikari:
       maximum-pool-size: 10
       minimum-idle: 2
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: ${REDIS_DATABASE:0}
+      timeout: ${REDIS_TIMEOUT:2s}
   jackson:
     time-zone: Asia/Shanghai
     date-format: yyyy-MM-dd HH:mm:ss
@@ -35,3 +42,8 @@ edu-system:
     allowed-origins:
       - http://localhost:5173
       - http://127.0.0.1:5173
+  selection:
+    available-cache:
+      enabled: ${SELECTION_AVAILABLE_CACHE_ENABLED:true}
+      ttl-seconds: ${SELECTION_AVAILABLE_CACHE_TTL_SECONDS:30}
+      round-ttl-seconds: ${SELECTION_ROUND_CACHE_TTL_SECONDS:5}

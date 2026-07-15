@@ -66,9 +66,12 @@ public class StudentController {
     }
 
     @PostMapping("/{studentId}/select")
-    public ApiResponse<Map<String, String>> select(@PathVariable Long studentId, @RequestBody SelectionRequest request) {
-        String requestId = selectionService.selectCourse(studentId, request.teachingClassId(), request.roundId());
-        return ApiResponse.ok("选课成功", Map.of("requestId", requestId));
+    public ApiResponse<Map<String, Object>> select(@PathVariable Long studentId, @RequestBody SelectionRequest request) {
+        Map<String, Object> result = selectionService.selectCourse(studentId, request.teachingClassId(), request.roundId());
+        String message = Boolean.TRUE.equals(result.get("selectionLimitWarning"))
+                ? "选课成功：已达到本学期课程数量建议上限，请注意合理安排"
+                : "选课成功";
+        return ApiResponse.ok(message, result);
     }
 
     @PostMapping("/{studentId}/drop/{selectionId}")

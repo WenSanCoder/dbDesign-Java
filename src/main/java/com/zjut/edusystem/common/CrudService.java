@@ -39,6 +39,61 @@ public class CrudService {
         return jdbc.queryForList(sql.toString(), params);
     }
 
+    public Map<String, Object> page(
+            CrudDefinition definition,
+            Map<String, String> requestParams,
+            List<String> keywordColumns,
+            Map<String, String> filterColumns,
+            String pageOrderBy
+    ) {
+        int page = normalizePositiveInteger(requestParams.get("page"), 1);
+        int pageSize = Math.min(normalizePositiveInteger(requestParams.get("pageSize"), 10), 100);
+        MapSqlParameterSource params = new MapSqlParameterSource()
+                .addValue("limit", pageSize)
+                .addValue("offset", (page - 1) * pageSize);
+        StringBuilder where = new StringBuilder(" WHERE 1 = 1");
+
+        String keyword = requestParams.get("keyword");
+        if (StringUtils.hasText(keyword) && !keywordColumns.isEmpty()) {
+            where.append(" AND (");
+            for (int index = 0; index < keywordColumns.size(); index++) {
+                if (index > 0) {
+                    where.append(" OR ");
+                }
+                where.append("LOWER(CAST(resource_rows.")
+                        .append(keywordColumns.get(index))
+                        .append(" AS TEXT)) LIKE :keyword");
+            }
+            where.append(")");
+            params.addValue("keyword", "%" + keyword.trim().toLowerCase() + "%");
+        }
+
+        filterColumns.forEach((requestKey, column) -> {
+            String value = requestParams.get(requestKey);
+            if (StringUtils.hasText(value)) {
+                where.append(" AND CAST(resource_rows.")
+                        .append(column)
+                        .append(" AS TEXT) = :filter_")
+                        .append(requestKey);
+                params.addValue("filter_" + requestKey, value.trim());
+            }
+        });
+
+        String wrappedSql = " FROM (" + definition.listSql() + ") resource_rows" + where;
+        Long total = jdbc.queryForObject("SELECT COUNT(*)" + wrappedSql, params, Long.class);
+        List<Map<String, Object>> records = jdbc.queryForList(
+                "SELECT resource_rows.*" + wrappedSql + " ORDER BY " + pageOrderBy + " LIMIT :limit OFFSET :offset",
+                params
+        );
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("records", records);
+        result.put("total", total == null ? 0L : total);
+        result.put("page", page);
+        result.put("pageSize", pageSize);
+        return result;
+    }
+
     public Map<String, Object> get(CrudDefinition definition, Long id) {
         String sql = "SELECT * FROM " + definition.table() + " WHERE " + definition.idColumn() + " = :id";
         List<Map<String, Object>> rows = jdbc.queryForList(sql, new MapSqlParameterSource("id", id));
@@ -89,5 +144,17 @@ public class CrudService {
             }
         }
         return values;
+    }
+
+    private int normalizePositiveInteger(String value, int defaultValue) {
+        if (!StringUtils.hasText(value)) {
+            return defaultValue;
+        }
+        try {
+            int parsed = Integer.parseInt(value);
+            return parsed > 0 ? parsed : defaultValue;
+        } catch (NumberFormatException ignored) {
+            return defaultValue;
+        }
     }
 }

@@ -26,7 +26,21 @@ public class TeacherService {
         StringBuilder sql = new StringBuilder("""
                 SELECT v.teacher_id, v.teacher_no, v.teacher_name, v.teaching_class_id, v.class_code, v.class_name,
                        v.course_code, v.course_name, v.credit, v.academic_year, v.semester, v.capacity,
-                       v.selected_count, v.waitlist_count, v.status,
+                       (SELECT COUNT(*)
+                        FROM student_course_selection scs
+                        WHERE scs.teaching_class_id = v.teaching_class_id
+                          AND scs.status = 'selected') AS selected_count,
+                       (SELECT COUNT(*)
+                        FROM selection_waitlist sw
+                        WHERE sw.teaching_class_id = v.teaching_class_id
+                          AND sw.status = 'waiting') AS waitlist_count,
+                       v.status,
+                       (SELECT b.lr_status13 FROM sht_grade_workflow_batches13 b
+                        WHERE b.lr_teaching_class_id13 = v.teaching_class_id
+                        ORDER BY b.lr_submission_no13 DESC LIMIT 1) AS grade_batch_status,
+                       (SELECT b.lr_submission_no13 FROM sht_grade_workflow_batches13 b
+                        WHERE b.lr_teaching_class_id13 = v.teaching_class_id
+                        ORDER BY b.lr_submission_no13 DESC LIMIT 1) AS grade_submission_no,
                        string_agg(cs.weekday || ' ' || cs.start_period || '-' || cs.end_period || '节 ' || cs.classroom, '; ') AS schedule_text
                 FROM v_teacher_classes v
                 LEFT JOIN class_schedule cs ON cs.teaching_class_id = v.teaching_class_id
@@ -52,15 +66,24 @@ public class TeacherService {
         sql.append("""
                 GROUP BY v.teacher_id, v.teacher_no, v.teacher_name, v.teaching_class_id, v.class_code, v.class_name,
                          v.course_code, v.course_name, v.credit, v.academic_year, v.semester, v.capacity,
-                         v.selected_count, v.waitlist_count, v.status
+                         v.status
                 ORDER BY v.teaching_class_id DESC
                 """);
         return jdbc.queryForList(sql.toString(), params);
     }
 
-    public List<Map<String, Object>> students(Long teacherId, Long teachingClassId) {
+    public Map<String, Object> students(Long teacherId, Long teachingClassId, String keyword, Integer page, Integer pageSize) {
         ensureTeacherClass(teacherId, teachingClassId);
-        return jdbc.queryForList("""
+        MapSqlParameterSource params = pageParams(teachingClassId, keyword, page, pageSize);
+        String filter = studentKeywordFilter(keyword);
+        Long total = count("""
+                SELECT COUNT(*)
+                FROM student_course_selection scs
+                JOIN student s ON s.student_id = scs.student_id
+                WHERE scs.teaching_class_id = :teachingClassId
+                  AND scs.status = 'selected'
+                """ + filter, params);
+        List<Map<String, Object>> records = jdbc.queryForList("""
                 SELECT s.student_id, s.student_no, s.student_name, s.gender, s.phone,
                        c.college_name, m.major_name, ac.class_name AS admin_class_name,
                        scs.selection_id, scs.selected_at, scs.status
@@ -71,17 +94,29 @@ public class TeacherService {
                 JOIN college c ON c.college_id = m.college_id
                 WHERE scs.teaching_class_id = :teachingClassId
                   AND scs.status = 'selected'
+                %s
                 ORDER BY s.student_no
-                """, new MapSqlParameterSource("teachingClassId", teachingClassId));
+                LIMIT :limit OFFSET :offset
+                """.formatted(filter), params);
+        return pageResult(records, total, page, pageSize);
     }
 
-    public List<Map<String, Object>> grades(Long teacherId, Long teachingClassId) {
+    public Map<String, Object> grades(Long teacherId, Long teachingClassId, String keyword, Integer page, Integer pageSize) {
         ensureTeacherClass(teacherId, teachingClassId);
         boolean hasGradeWeights = gradeWeightColumnsExist();
         String weightSelect = hasGradeWeights
                 ? "COALESCE(gr.usual_weight, 30) AS usual_weight,\n                       COALESCE(gr.exam_weight, 70) AS exam_weight,"
                 : "30 AS usual_weight,\n                       70 AS exam_weight,";
-        return jdbc.queryForList("""
+        MapSqlParameterSource params = pageParams(teachingClassId, keyword, page, pageSize);
+        String filter = studentKeywordFilter(keyword);
+        Long total = count("""
+                SELECT COUNT(*)
+                FROM student_course_selection scs
+                JOIN student s ON s.student_id = scs.student_id
+                WHERE scs.teaching_class_id = :teachingClassId
+                  AND scs.status = 'selected'
+                """ + filter, params);
+        List<Map<String, Object>> records = jdbc.queryForList("""
                 SELECT s.student_id, s.student_no, s.student_name, ac.class_name AS admin_class_name,
                        scs.selection_id, gr.grade_id, gr.usual_score, gr.exam_score, gr.final_score,
                        %s
@@ -92,13 +127,17 @@ public class TeacherService {
                 LEFT JOIN grade_record gr ON gr.selection_id = scs.selection_id
                 WHERE scs.teaching_class_id = :teachingClassId
                   AND scs.status = 'selected'
+                %s
                 ORDER BY s.student_no
-                """.formatted(weightSelect), new MapSqlParameterSource("teachingClassId", teachingClassId));
+                LIMIT :limit OFFSET :offset
+                """.formatted(weightSelect, filter), params);
+        return pageResult(records, total, page, pageSize);
     }
 
     @Transactional
     public void saveGrades(Long teacherId, Long teachingClassId, List<GradeInput> grades, boolean submit) {
         ensureTeacherClass(teacherId, teachingClassId);
+        ensureGradesEditable(teachingClassId);
         boolean hasGradeWeights = gradeWeightColumnsExist();
         for (GradeInput grade : grades) {
             validateGrade(grade);
@@ -219,6 +258,17 @@ public class TeacherService {
                 """, Map.of("teacherId", teacherId, "teachingClassId", teachingClassId), "该教学班不属于当前教师");
     }
 
+    private void ensureGradesEditable(Long teachingClassId) {
+        Long locked = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM sht_grade_workflow_batches13
+                WHERE lr_teaching_class_id13 = :teachingClassId
+                  AND lr_status13 IN ('submitted', 'approved')
+                """, new MapSqlParameterSource("teachingClassId", teachingClassId), Long.class);
+        if (locked != null && locked > 0) {
+            throw new BusinessException("成绩已提交审批或已经通过，当前不可修改");
+        }
+    }
+
     private boolean isDefaultWeight(GradeInput grade) {
         return Math.abs(grade.usualWeight() - 30) < 0.001 && Math.abs(grade.examWeight() - 70) < 0.001;
     }
@@ -261,6 +311,55 @@ public class TeacherService {
         if (score != null && (score < 0 || score > 100)) {
             throw new BusinessException(label + "必须在 0 到 100 之间");
         }
+    }
+
+    private MapSqlParameterSource pageParams(Long teachingClassId, String keyword, Integer page, Integer pageSize) {
+        int normalizedPage = normalizePage(page);
+        int normalizedPageSize = normalizePageSize(pageSize);
+        MapSqlParameterSource params = new MapSqlParameterSource("teachingClassId", teachingClassId)
+                .addValue("limit", normalizedPageSize)
+                .addValue("offset", (normalizedPage - 1) * normalizedPageSize);
+        if (StringUtils.hasText(keyword)) {
+            params.addValue("keyword", "%" + keyword.trim() + "%");
+        }
+        return params;
+    }
+
+    private String studentKeywordFilter(String keyword) {
+        if (!StringUtils.hasText(keyword)) {
+            return "";
+        }
+        return """
+                  AND (
+                      s.student_no LIKE :keyword
+                      OR s.student_name LIKE :keyword
+                  )
+                """;
+    }
+
+    private Map<String, Object> pageResult(List<Map<String, Object>> records, Long total, Integer page, Integer pageSize) {
+        return Map.of(
+                "records", records,
+                "total", total == null ? 0L : total,
+                "page", normalizePage(page),
+                "pageSize", normalizePageSize(pageSize)
+        );
+    }
+
+    private Long count(String sql, MapSqlParameterSource params) {
+        Number value = jdbc.queryForObject(sql, params, Number.class);
+        return value == null ? 0L : value.longValue();
+    }
+
+    private int normalizePage(Integer page) {
+        return page == null || page < 1 ? 1 : page;
+    }
+
+    private int normalizePageSize(Integer pageSize) {
+        if (pageSize == null || pageSize < 1) {
+            return 10;
+        }
+        return Math.min(pageSize, 100);
     }
 
     private Map<String, Object> queryOne(String sql, Map<String, ?> params, String errorMessage) {

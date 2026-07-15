@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/admin")
@@ -30,8 +31,21 @@ public class AdminCrudController {
     }
 
     @GetMapping("/{resource}")
-    public ApiResponse<List<Map<String, Object>>> list(@PathVariable String resource, @RequestParam Map<String, String> filters) {
-        return ApiResponse.ok(crudService.list(definition(resource), filters));
+    public ApiResponse<Object> list(@PathVariable String resource, @RequestParam Map<String, String> filters) {
+        CrudDefinition definition = definition(resource);
+        if ("teaching-classes".equals(resource)) {
+            reconcileTeachingClassCounters(null);
+        }
+        if ("true".equalsIgnoreCase(filters.get("paged"))) {
+            return ApiResponse.ok(crudService.page(
+                    definition,
+                    filters,
+                    pageKeywordColumns(resource),
+                    pageFilterColumns(resource),
+                    pageOrderBy(resource)
+            ));
+        }
+        return ApiResponse.ok(crudService.list(definition, filters));
     }
 
     @GetMapping("/{resource}/{id}")
@@ -43,6 +57,8 @@ public class AdminCrudController {
     @Transactional
     public ApiResponse<Void> create(@PathVariable String resource, @Valid @RequestBody Map<String, Object> body) {
         normalizeNoticePayload(resource, body, true);
+        normalizeGenderPayload(resource, body);
+        normalizeAdminClassPayload(resource, body);
         normalizeCoursePayload(resource, body);
         normalizeTeachingClassPayload(resource, body, false);
         validateSchedulePayload(resource, body);
@@ -50,6 +66,8 @@ public class AdminCrudController {
         validateMajorGradePayload(resource, body);
         validateTermPayload(resource, body);
         validateGradeYearPayload(resource, body);
+        validateRoundPayload(resource, body, null);
+        validateDefaultClassAssignment(resource, body);
         crudService.create(definition(resource), body);
         if ("students".equals(resource)) {
             Long studentId = findIdByCode("student", "student_id", "student_no", text(body.get("student_no")));
@@ -68,6 +86,8 @@ public class AdminCrudController {
     public ApiResponse<Void> update(@PathVariable String resource, @PathVariable Long id, @RequestBody Map<String, Object> body) {
         CrudDefinition definition = definition(resource);
         normalizeNoticePayload(resource, body, false);
+        normalizeGenderPayload(resource, body);
+        normalizeAdminClassPayload(resource, body);
         normalizeCoursePayload(resource, body);
         normalizeTeachingClassPayload(resource, body, true);
         validateSchedulePayload(resource, body);
@@ -75,6 +95,7 @@ public class AdminCrudController {
         validateMajorGradePayload(resource, body);
         validateTermPayload(resource, body);
         validateGradeYearPayload(resource, body);
+        validateRoundPayload(resource, body, id);
         boolean accountResource = "students".equals(resource) || "teachers".equals(resource);
         boolean hasWritableFields = hasWritableFields(definition, body);
         if (hasWritableFields) {
@@ -102,6 +123,9 @@ public class AdminCrudController {
             deleteAccount("TEACHER", id);
         } else if ("grade-years".equals(resource)) {
             validateGradeYearDelete(id);
+        } else if ("class-default-classes".equals(resource)) {
+            removeDefaultClassSelection(id);
+            return ApiResponse.ok("默认行政班已移除，班内学生已退课", null);
         }
         crudService.delete(definition(resource), id);
         return ApiResponse.ok("删除成功", null);
@@ -243,7 +267,7 @@ public class AdminCrudController {
                 "admin_class_id",
                 List.of("class_code", "class_name", "major_id", "grade_year", "head_teacher_id", "status"),
                 "SELECT ac.*, m.major_name, c.college_id, c.college_name, t.teacher_name AS head_teacher_name FROM admin_class ac JOIN major m ON m.major_id = ac.major_id JOIN college c ON c.college_id = m.college_id LEFT JOIN teacher t ON t.teacher_id = ac.head_teacher_id",
-                "ac.admin_class_id DESC"
+                "c.college_name, m.major_name, ac.grade_year DESC, ac.class_code"
         ));
         definitions.put("grade-years", new CrudDefinition(
                 "grade_year",
@@ -298,7 +322,11 @@ public class AdminCrudController {
                 "teaching_class",
                 "teaching_class_id",
                 List.of("class_code", "class_name", "course_id", "teacher_id", "term_id", "campus_id", "capacity", "selected_count", "waitlist_count", "status"),
-                "SELECT tc.*, c.course_code, c.course_name, c.credit, c.hours, t.teacher_name, term.academic_year, term.semester, campus.campus_name FROM teaching_class tc JOIN course c ON c.course_id = tc.course_id JOIN teacher t ON t.teacher_id = tc.teacher_id JOIN term ON term.term_id = tc.term_id JOIN campus ON campus.campus_id = tc.campus_id",
+                "SELECT tc.teaching_class_id, tc.class_code, tc.class_name, tc.course_id, tc.teacher_id, tc.term_id, tc.campus_id, tc.capacity, " +
+                        "(SELECT COUNT(*) FROM student_course_selection scs WHERE scs.teaching_class_id = tc.teaching_class_id AND scs.status IN ('processing', 'selected')) AS selected_count, " +
+                        "(SELECT COUNT(*) FROM selection_waitlist sw WHERE sw.teaching_class_id = tc.teaching_class_id AND sw.status = 'waiting') AS waitlist_count, " +
+                        "tc.status, c.course_code, c.course_name, c.credit, c.hours, t.teacher_name, term.academic_year, term.semester, campus.campus_name " +
+                        "FROM teaching_class tc JOIN course c ON c.course_id = tc.course_id JOIN teacher t ON t.teacher_id = tc.teacher_id JOIN term ON term.term_id = tc.term_id JOIN campus ON campus.campus_id = tc.campus_id",
                 "tc.teaching_class_id DESC"
         ));
         definitions.put("class-schedules", new CrudDefinition(
@@ -312,15 +340,21 @@ public class AdminCrudController {
                 "teaching_class_admin_class",
                 "assignment_id",
                 List.of("teaching_class_id", "admin_class_id"),
-                "SELECT tcac.assignment_id, tcac.teaching_class_id, tcac.admin_class_id, tc.class_code, tc.class_name, c.course_code, c.course_name, ac.class_name AS admin_class_name, ac.grade_year FROM teaching_class_admin_class tcac JOIN teaching_class tc ON tc.teaching_class_id = tcac.teaching_class_id JOIN course c ON c.course_id = tc.course_id JOIN admin_class ac ON ac.admin_class_id = tcac.admin_class_id",
+                "SELECT tcac.assignment_id, tcac.teaching_class_id, tcac.admin_class_id, tc.course_id, tc.term_id, tc.class_code, tc.class_name, c.course_code, c.course_name, ac.class_name AS admin_class_name, ac.grade_year FROM teaching_class_admin_class tcac JOIN teaching_class tc ON tc.teaching_class_id = tcac.teaching_class_id JOIN course c ON c.course_id = tc.course_id JOIN admin_class ac ON ac.admin_class_id = tcac.admin_class_id",
                 "tcac.assignment_id DESC"
         ));
         definitions.put("rounds", new CrudDefinition(
                 "course_selection_round",
                 "round_id",
                 List.of("term_id", "round_name", "start_time", "end_time", "status", "waitlist_enabled"),
-                "SELECT csr.*, term.academic_year, term.semester FROM course_selection_round csr JOIN term ON term.term_id = csr.term_id",
-                "csr.round_id DESC"
+                "SELECT csr.round_id, csr.term_id, csr.round_name, csr.start_time, csr.end_time, csr.waitlist_enabled, " +
+                        "CASE WHEN csr.status = 'closed' THEN 'closed' " +
+                        "WHEN CURRENT_TIMESTAMP < csr.start_time THEN 'not_started' " +
+                        "WHEN CURRENT_TIMESTAMP <= csr.end_time THEN 'open' " +
+                        "ELSE 'ended' END AS status, " +
+                        "term.academic_year, term.semester " +
+                        "FROM course_selection_round csr JOIN term ON term.term_id = csr.term_id",
+                "csr.start_time DESC, csr.round_id DESC"
         ));
         definitions.put("terms", new CrudDefinition(
                 "term",
@@ -553,6 +587,56 @@ public class AdminCrudController {
         }
     }
 
+    private void normalizeGenderPayload(String resource, Map<String, Object> body) {
+        if (!"students".equals(resource) && !"teachers".equals(resource)) {
+            return;
+        }
+        String gender = text(body.get("gender"));
+        if (!StringUtils.hasText(gender)) {
+            return;
+        }
+        if ("male".equals(gender)) {
+            body.put("gender", "男");
+        } else if ("female".equals(gender)) {
+            body.put("gender", "女");
+        }
+    }
+
+    private void normalizeAdminClassPayload(String resource, Map<String, Object> body) {
+        if (!"admin-classes".equals(resource)) {
+            return;
+        }
+        Long majorId = longValue(body.get("major_id"));
+        Integer gradeYear = integer(body.get("grade_year"));
+        if (majorId == null || gradeYear == null) {
+            return;
+        }
+
+        Integer classNo = integer(body.get("class_no"));
+        if (classNo == null) {
+            String classCode = text(body.get("class_code"));
+            if (StringUtils.hasText(classCode)) {
+                String[] parts = classCode.split("-");
+                if (parts.length >= 3) {
+                    classNo = integer(parts[parts.length - 1]);
+                }
+            }
+        }
+        if (classNo == null || classNo < 1 || classNo > 99) {
+            throw new BusinessException("行政班班号必须在 1-99 范围内");
+        }
+
+        Map<String, Object> major = queryOne("""
+                SELECT major_code, major_name
+                FROM major
+                WHERE major_id = :majorId
+                """, new MapSqlParameterSource("majorId", majorId), "专业不存在");
+        String majorCode = text(major.get("major_code"));
+        String majorName = text(major.get("major_name"));
+        body.put("class_code", majorCode + "-" + gradeYear + "-" + String.format("%02d", classNo));
+        body.put("class_name", gradeYear + "级" + majorName + classNo + "班");
+    }
+
     private void applyDefaultClassSelection(Map<String, Object> body) {
         Long teachingClassId = longValue(body.get("teaching_class_id"));
         Long adminClassId = longValue(body.get("admin_class_id"));
@@ -560,9 +644,16 @@ public class AdminCrudController {
             throw new BusinessException("默认班级分配必须选择教学班和行政班");
         }
 
+        reconcileTeachingClassCounters(teachingClassId);
+
         Map<String, Object> teachingClass = queryOne("""
                 SELECT tc.teaching_class_id, tc.course_id, tc.term_id, tc.campus_id, campus.campus_name,
-                       tc.capacity, tc.selected_count, c.course_name
+                       tc.capacity,
+                       (SELECT COUNT(*)
+                        FROM student_course_selection scs
+                        WHERE scs.teaching_class_id = tc.teaching_class_id
+                          AND scs.status IN ('processing', 'selected')) AS selected_count,
+                       c.course_name
                 FROM teaching_class tc
                 JOIN course c ON c.course_id = tc.course_id
                 JOIN campus ON campus.campus_id = tc.campus_id
@@ -645,10 +736,11 @@ public class AdminCrudController {
             return;
         }
 
+        String requestIdPrefix = "DEF-" + UUID.randomUUID();
         jdbc.update("""
                 INSERT INTO student_course_selection(request_id, student_id, teaching_class_id, round_id, status, selected_at, selection_source)
                 SELECT
-                    'DEFAULT-' || CAST(:teachingClassId AS TEXT) || '-' || CAST(s.student_id AS TEXT),
+                    :requestIdPrefix || '-' || CAST(s.student_id AS TEXT),
                     s.student_id,
                     :teachingClassId,
                     :roundId,
@@ -675,6 +767,7 @@ public class AdminCrudController {
                         AND scs2.status IN ('processing', 'selected')
                   )
                 """, new MapSqlParameterSource()
+                .addValue("requestIdPrefix", requestIdPrefix)
                 .addValue("teachingClassId", teachingClassId)
                 .addValue("roundId", round.get("round_id"))
                 .addValue("adminClassId", adminClassId)
@@ -683,11 +776,255 @@ public class AdminCrudController {
 
         jdbc.update("""
                 UPDATE teaching_class
-                SET selected_count = selected_count + :count
+                SET selected_count = (
+                        SELECT COUNT(*)
+                        FROM student_course_selection scs
+                        WHERE scs.teaching_class_id = :teachingClassId
+                          AND scs.status IN ('processing', 'selected')
+                    ),
+                    waitlist_count = (
+                        SELECT COUNT(*)
+                        FROM selection_waitlist sw
+                        WHERE sw.teaching_class_id = :teachingClassId
+                          AND sw.status = 'waiting'
+                    )
                 WHERE teaching_class_id = :teachingClassId
                 """, new MapSqlParameterSource()
-                .addValue("count", need)
                 .addValue("teachingClassId", teachingClassId));
+    }
+
+    private void validateDefaultClassAssignment(String resource, Map<String, Object> body) {
+        if (!"class-default-classes".equals(resource)) {
+            return;
+        }
+        Long teachingClassId = longValue(body.get("teaching_class_id"));
+        Long adminClassId = longValue(body.get("admin_class_id"));
+        if (teachingClassId == null || adminClassId == null) {
+            throw new BusinessException("默认班级分配必须选择教学班和行政班");
+        }
+
+        List<Map<String, Object>> eligibleRows = jdbc.queryForList("""
+                SELECT ac.class_name AS admin_class_name,
+                       c.course_name,
+                       term.academic_year,
+                       term.semester
+                FROM teaching_class target_tc
+                JOIN course c ON c.course_id = target_tc.course_id
+                JOIN term ON term.term_id = target_tc.term_id
+                JOIN admin_class ac ON ac.admin_class_id = :adminClassId
+                WHERE target_tc.teaching_class_id = :teachingClassId
+                  AND EXISTS (
+                      SELECT 1
+                      FROM teaching_plan tp
+                      WHERE tp.major_id = ac.major_id
+                        AND tp.grade_year = ac.grade_year
+                        AND tp.term_id = target_tc.term_id
+                        AND tp.course_id = target_tc.course_id
+                  )
+                LIMIT 1
+                """, new MapSqlParameterSource()
+                .addValue("teachingClassId", teachingClassId)
+                .addValue("adminClassId", adminClassId));
+        if (eligibleRows.isEmpty()) {
+            throw new BusinessException("该行政班本学期未在该课程培养方案中，不能设为默认行政班");
+        }
+
+        List<Map<String, Object>> conflicts = jdbc.queryForList("""
+                SELECT ac.class_name AS admin_class_name,
+                       c.course_name,
+                       assigned_tc.class_name AS assigned_class_name
+                FROM teaching_class target_tc
+                JOIN course c ON c.course_id = target_tc.course_id
+                JOIN teaching_class_admin_class tcac ON tcac.admin_class_id = :adminClassId
+                JOIN teaching_class assigned_tc ON assigned_tc.teaching_class_id = tcac.teaching_class_id
+                JOIN admin_class ac ON ac.admin_class_id = tcac.admin_class_id
+                WHERE target_tc.teaching_class_id = :teachingClassId
+                  AND assigned_tc.teaching_class_id <> target_tc.teaching_class_id
+                  AND assigned_tc.course_id = target_tc.course_id
+                  AND assigned_tc.term_id = target_tc.term_id
+                LIMIT 1
+                """, new MapSqlParameterSource()
+                .addValue("teachingClassId", teachingClassId)
+                .addValue("adminClassId", adminClassId));
+        if (!conflicts.isEmpty()) {
+            Map<String, Object> conflict = conflicts.get(0);
+            throw new BusinessException(text(conflict.get("admin_class_name"))
+                    + " 已分配到课程“" + text(conflict.get("course_name"))
+                    + "”的教学班“" + text(conflict.get("assigned_class_name"))
+                    + "”，请先移除原默认行政班");
+        }
+    }
+
+    private void removeDefaultClassSelection(Long assignmentId) {
+        Map<String, Object> assignment = queryOne("""
+                SELECT assignment_id, teaching_class_id, admin_class_id
+                FROM teaching_class_admin_class
+                WHERE assignment_id = :assignmentId
+                """, new MapSqlParameterSource("assignmentId", assignmentId), "默认行政班关联不存在");
+        Long teachingClassId = longValue(assignment.get("teaching_class_id"));
+        Long adminClassId = longValue(assignment.get("admin_class_id"));
+
+        jdbc.update("""
+                UPDATE student_course_selection scs
+                SET status = 'dropped',
+                    dropped_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE scs.teaching_class_id = :teachingClassId
+                  AND scs.status IN ('processing', 'selected')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM student s
+                      WHERE s.student_id = scs.student_id
+                        AND s.admin_class_id = :adminClassId
+                  )
+                """, new MapSqlParameterSource()
+                .addValue("teachingClassId", teachingClassId)
+                .addValue("adminClassId", adminClassId));
+
+        jdbc.update("""
+                DELETE FROM teaching_class_admin_class
+                WHERE assignment_id = :assignmentId
+                """, new MapSqlParameterSource("assignmentId", assignmentId));
+        reconcileTeachingClassCounters(teachingClassId);
+    }
+
+    private void reconcileTeachingClassCounters(Long teachingClassId) {
+        String scope = teachingClassId == null ? "" : " WHERE tc.teaching_class_id = :teachingClassId";
+        MapSqlParameterSource params = new MapSqlParameterSource();
+        if (teachingClassId != null) {
+            params.addValue("teachingClassId", teachingClassId);
+        }
+        jdbc.update("""
+                UPDATE teaching_class tc
+                SET selected_count = (
+                        SELECT COUNT(*)
+                        FROM student_course_selection scs
+                        WHERE scs.teaching_class_id = tc.teaching_class_id
+                          AND scs.status IN ('processing', 'selected')
+                    ),
+                    waitlist_count = (
+                        SELECT COUNT(*)
+                        FROM selection_waitlist sw
+                        WHERE sw.teaching_class_id = tc.teaching_class_id
+                          AND sw.status = 'waiting'
+                    )
+                """ + scope, params);
+    }
+
+    private List<String> pageKeywordColumns(String resource) {
+        return switch (resource) {
+            case "colleges" -> List.of("college_code", "college_name", "campus_name");
+            case "majors" -> List.of("major_code", "major_name", "college_name", "campus_name");
+            case "admin-classes" -> List.of("class_code", "class_name", "major_name", "college_name", "head_teacher_name");
+            case "students" -> List.of("student_no", "student_name", "class_name", "major_name", "college_name");
+            case "teachers" -> List.of("teacher_no", "teacher_name", "title", "college_name");
+            case "notices" -> List.of("title", "content", "publisher_name");
+            case "courses" -> List.of("course_code", "course_name", "college_name");
+            case "buildings" -> List.of("building_code", "building_name", "campus_name");
+            case "classrooms" -> List.of("room_code", "room_name", "building_name", "campus_name");
+            case "rounds" -> List.of("round_name", "academic_year", "semester");
+            default -> List.of();
+        };
+    }
+
+    private Map<String, String> pageFilterColumns(String resource) {
+        return switch (resource) {
+            case "colleges", "buildings" -> Map.of("campusId", "campus_id");
+            case "majors" -> Map.of("campusId", "campus_id", "collegeId", "college_id");
+            case "admin-classes" -> Map.of("collegeId", "college_id", "majorId", "major_id", "gradeYear", "grade_year");
+            case "courses" -> Map.of("collegeId", "college_id");
+            case "classrooms" -> Map.of("campusId", "campus_id", "buildingId", "building_id");
+            default -> Map.of();
+        };
+    }
+
+    private String pageOrderBy(String resource) {
+        return switch (resource) {
+            case "colleges" -> "resource_rows.campus_name, resource_rows.college_name, resource_rows.college_id";
+            case "majors" -> "resource_rows.college_name, resource_rows.major_name, resource_rows.major_id";
+            case "admin-classes" -> "resource_rows.college_name, resource_rows.major_name, resource_rows.grade_year DESC, resource_rows.class_code";
+            case "students" -> "resource_rows.student_id DESC";
+            case "teachers" -> "resource_rows.teacher_id DESC";
+            case "notices" -> "resource_rows.created_at DESC, resource_rows.notice_id DESC";
+            case "courses" -> "resource_rows.course_code, resource_rows.course_id";
+            case "buildings" -> "resource_rows.campus_name, resource_rows.building_name, resource_rows.building_id";
+            case "classrooms" -> "resource_rows.campus_name, resource_rows.building_name, resource_rows.floor_no, resource_rows.room_no, resource_rows.classroom_id";
+            case "rounds" -> "resource_rows.start_time DESC, resource_rows.round_id DESC";
+            default -> "1";
+        };
+    }
+
+    private void validateRoundPayload(String resource, Map<String, Object> body, Long roundId) {
+        if (!"rounds".equals(resource)) {
+            return;
+        }
+
+        Map<String, Object> current = roundId == null ? Map.of() : crudService.get(definition("rounds"), roundId);
+        Long termId = longValue(valueOrCurrent(body, current, "term_id"));
+        String roundName = text(valueOrCurrent(body, current, "round_name"));
+        String startTime = text(valueOrCurrent(body, current, "start_time"));
+        String endTime = text(valueOrCurrent(body, current, "end_time"));
+        String status = text(body.get("status"));
+
+        if (termId == null) {
+            throw new BusinessException("选课轮次必须选择学期");
+        }
+        if (!StringUtils.hasText(roundName)) {
+            throw new BusinessException("选课轮次名称不能为空");
+        }
+        if (!StringUtils.hasText(startTime) || !StringUtils.hasText(endTime)) {
+            throw new BusinessException("选课轮次必须填写开始时间和结束时间");
+        }
+
+        Integer validOrder = jdbc.queryForObject("""
+                SELECT CASE WHEN CAST(:startTime AS TIMESTAMP) < CAST(:endTime AS TIMESTAMP) THEN 1 ELSE 0 END
+                """, new MapSqlParameterSource()
+                .addValue("startTime", startTime)
+                .addValue("endTime", endTime), Integer.class);
+        if (validOrder == null || validOrder == 0) {
+            throw new BusinessException("选课轮次开始时间必须早于结束时间");
+        }
+
+        List<Map<String, Object>> conflicts = jdbc.queryForList("""
+                SELECT round_id, round_name
+                FROM course_selection_round
+                WHERE term_id = :termId
+                  AND (:roundId IS NULL OR round_id <> :roundId)
+                  AND start_time < CAST(:endTime AS TIMESTAMP)
+                  AND end_time > CAST(:startTime AS TIMESTAMP)
+                ORDER BY start_time ASC, round_id ASC
+                LIMIT 1
+                """, new MapSqlParameterSource()
+                .addValue("termId", termId)
+                .addValue("roundId", roundId)
+                .addValue("startTime", startTime)
+                .addValue("endTime", endTime));
+        if (!conflicts.isEmpty()) {
+            throw new BusinessException("选课轮次时间与 " + text(conflicts.get(0).get("round_name")) + " 重叠");
+        }
+
+        if ("closed".equals(status)) {
+            body.put("status", "closed");
+        } else {
+            body.put("status", effectiveRoundStatus(startTime, endTime));
+        }
+    }
+
+    private String effectiveRoundStatus(String startTime, String endTime) {
+        return jdbc.queryForObject("""
+                SELECT CASE
+                         WHEN CURRENT_TIMESTAMP < CAST(:startTime AS TIMESTAMP) THEN 'not_started'
+                         WHEN CURRENT_TIMESTAMP <= CAST(:endTime AS TIMESTAMP) THEN 'open'
+                         ELSE 'ended'
+                       END
+                """, new MapSqlParameterSource()
+                .addValue("startTime", startTime)
+                .addValue("endTime", endTime), String.class);
+    }
+
+    private Object valueOrCurrent(Map<String, Object> body, Map<String, Object> current, String key) {
+        Object value = body.get(key);
+        return value != null ? value : current.get(key);
     }
 
     private void validateTrainingPlanPayload(String resource, Map<String, Object> body) {

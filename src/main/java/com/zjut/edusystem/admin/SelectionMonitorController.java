@@ -33,10 +33,22 @@ public class SelectionMonitorController {
                   (SELECT COUNT(*) FROM teaching_class WHERE selected_count >= capacity) AS full_class_count
                 """, Map.of()));
         result.put("rounds", jdbc.queryForList("""
-                SELECT csr.*, term.academic_year, term.semester
+                SELECT csr.round_id, csr.term_id, csr.round_name, csr.start_time, csr.end_time, csr.waitlist_enabled,
+                       CASE
+                         WHEN csr.status = 'closed' THEN 'closed'
+                         WHEN CURRENT_TIMESTAMP < csr.start_time THEN 'not_started'
+                         WHEN CURRENT_TIMESTAMP <= csr.end_time THEN 'open'
+                         ELSE 'ended'
+                       END AS status,
+                       term.academic_year, term.semester
                 FROM course_selection_round csr
                 JOIN term ON term.term_id = csr.term_id
-                ORDER BY CASE WHEN csr.status = 'open' THEN 0 ELSE 1 END, csr.start_time DESC, csr.round_id DESC
+                ORDER BY CASE
+                           WHEN csr.status = 'closed' THEN 2
+                           WHEN CURRENT_TIMESTAMP BETWEEN csr.start_time AND csr.end_time THEN 0
+                           WHEN CURRENT_TIMESTAMP < csr.start_time THEN 1
+                           ELSE 3
+                         END, csr.start_time DESC, csr.round_id DESC
                 """, Map.of()));
         result.put("statusDistribution", jdbc.queryForList("""
                 SELECT status, COUNT(*) AS count
