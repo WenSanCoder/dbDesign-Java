@@ -66,7 +66,19 @@ if (-not $env:DB_URL) {
   $env:DB_URL = "jdbc:opengauss://x6.sjcmc.cn:34003/postgres?user=sht&password=@Sht20051229"
 }
 
+if (-not $env:REDIS_HOST) {
+  $env:REDIS_HOST = "127.0.0.1"
+}
+if (-not $env:REDIS_PORT) {
+  $env:REDIS_PORT = "6380"
+}
+if (-not $env:REDIS_DATABASE) {
+  $env:REDIS_DATABASE = "0"
+}
+
 Write-Host "Using JAVA_HOME=$env:JAVA_HOME"
+Write-Host "Redis SSH tunnel and password are loaded from application.yml."
+Write-Host "Using local Redis tunnel endpoint $env:REDIS_HOST`:$env:REDIS_PORT/$env:REDIS_DATABASE"
 java -version
 
 mvn -Dmaven.repo.local="$mavenRepo" spring-boot:run

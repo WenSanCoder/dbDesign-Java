@@ -648,20 +648,36 @@ public class GovernanceService {
     @Transactional
     public Long publishClassNotice(Long teacherId, Long teachingClassId, Map<String, Object> body) {
         Long userId = teacherUserId(teacherId);
-        Long owned = jdbc.queryForObject("SELECT COUNT(*) FROM teaching_class WHERE teaching_class_id = :classId AND teacher_id = :teacherId",
-                new MapSqlParameterSource().addValue("classId", teachingClassId).addValue("teacherId", teacherId), Long.class);
-        if (owned == null || owned == 0) {
-            throw new BusinessException("教学班不属于当前教师");
+        one("""
+                SELECT teaching_class_id
+                FROM teaching_class
+                WHERE teaching_class_id = :classId AND teacher_id = :teacherId
+                """, Map.of("classId", teachingClassId, "teacherId", teacherId), "教学班不属于当前教师");
+        Long recipientCount = jdbc.queryForObject("""
+                SELECT COUNT(DISTINCT student_id)
+                FROM student_course_selection
+                WHERE teaching_class_id = :classId AND status = 'selected'
+                """, new MapSqlParameterSource("classId", teachingClassId), Long.class);
+        if (recipientCount == null || recipientCount == 0) {
+            throw new BusinessException("当前教学班没有已选学生，无法发布通知");
         }
+        String noticeType = StringUtils.hasText(text(body.get("noticeType"))) ? text(body.get("noticeType")) : "normal";
+        if (!List.of("normal", "important").contains(noticeType)) {
+            throw new BusinessException("通知级别只能是普通或重要");
+        }
+        String title = requiredText(body, "title");
+        String content = requiredText(body, "content");
+        if (title.length() > 200) throw new BusinessException("通知标题不能超过 200 个字符");
+        if (content.length() > 2000) throw new BusinessException("通知正文不能超过 2000 个字符");
         Long noticeId = jdbc.queryForObject("""
                 INSERT INTO notice(user_id, notice_type, title, content, read_flag)
                 VALUES (:userId, :noticeType, :title, :content, FALSE)
                 RETURNING notice_id
                 """, new MapSqlParameterSource()
                 .addValue("userId", userId)
-                .addValue("noticeType", StringUtils.hasText(text(body.get("noticeType"))) ? text(body.get("noticeType")) : "normal")
-                .addValue("title", requiredText(body, "title"))
-                .addValue("content", requiredText(body, "content")), Long.class);
+                .addValue("noticeType", noticeType)
+                .addValue("title", title)
+                .addValue("content", content), Long.class);
         if (noticeId == null) {
             throw new BusinessException("通知创建失败");
         }

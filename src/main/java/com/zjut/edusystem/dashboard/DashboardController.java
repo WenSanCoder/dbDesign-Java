@@ -25,7 +25,7 @@ public class DashboardController {
     public ApiResponse<Map<String, Object>> admin() {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("term", queryOne("SELECT * FROM term WHERE is_current = TRUE LIMIT 1", Map.of()));
-        data.put("notices", queryList("SELECT * FROM notice ORDER BY created_at DESC LIMIT 6", Map.of()));
+        data.put("notices", publicNotices());
         data.put("round", queryOne("""
                 SELECT csr.round_id, csr.term_id, csr.round_name, csr.start_time, csr.end_time, csr.waitlist_enabled,
                        CASE
@@ -64,7 +64,7 @@ public class DashboardController {
                                  WHERE approved_batch.lr_teaching_class_id13 = gr.teaching_class_id
                                    AND approved_batch.lr_status13 = 'approved')) AS grade_count
                 """, Map.of("studentId", studentId)));
-        data.put("notices", queryList("SELECT * FROM notice ORDER BY created_at DESC LIMIT 6", Map.of()));
+        data.put("notices", publicNotices());
         return ApiResponse.ok(data);
     }
 
@@ -84,8 +84,24 @@ public class DashboardController {
                   )) AS pending_grade_count,
                   (SELECT COUNT(*) FROM course_review WHERE teacher_id = :teacherId) AS review_count
                 """, Map.of("teacherId", teacherId)));
-        data.put("notices", queryList("SELECT * FROM notice ORDER BY created_at DESC LIMIT 6", Map.of()));
+        data.put("notices", publicNotices());
         return ApiResponse.ok(data);
+    }
+
+    private List<Map<String, Object>> publicNotices() {
+        return queryList("""
+                SELECT n.*
+                FROM notice n
+                LEFT JOIN user_account publisher ON publisher.user_id = n.user_id
+                WHERE COALESCE(publisher.role_code, '') <> 'TEACHER'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM sht_teacher_class_notice_recipients13 recipients
+                    WHERE recipients.lr_teacher_class_notice_id13 = n.notice_id
+                )
+                ORDER BY n.created_at DESC, n.notice_id DESC
+                LIMIT 6
+                """, Map.of());
     }
 
     private Map<String, Object> queryOne(String sql, Map<String, ?> params) {

@@ -6,6 +6,7 @@ import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.LinkedHashMap;
@@ -22,85 +23,98 @@ public class SelectionMonitorController {
     }
 
     @GetMapping("/overview")
-    public ApiResponse<Map<String, Object>> overview() {
+    public ApiResponse<Map<String, Object>> overview(
+            @RequestParam(defaultValue = "") String capacityKeyword,
+            @RequestParam(defaultValue = "") String waitlistKeyword) {
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("summary", jdbc.queryForMap("""
-                SELECT
-                  (SELECT COUNT(*) FROM selection_request_log) AS total_requests,
-                  (SELECT COUNT(*) FROM student_course_selection WHERE status = 'selected') AS success_count,
-                  (SELECT COUNT(*) FROM selection_waitlist WHERE status = 'waiting') AS waitlist_count,
-                  (SELECT COUNT(*) FROM selection_request_log WHERE request_status IN ('failed', 'fail', 'error')) AS failed_count,
-                  (SELECT COUNT(*) FROM teaching_class WHERE selected_count >= capacity) AS full_class_count
-                """, Map.of()));
-        result.put("rounds", jdbc.queryForList("""
+        List<Map<String, Object>> currentRounds = jdbc.queryForList("""
                 SELECT csr.round_id, csr.term_id, csr.round_name, csr.start_time, csr.end_time, csr.waitlist_enabled,
-                       CASE
-                         WHEN csr.status = 'closed' THEN 'closed'
-                         WHEN CURRENT_TIMESTAMP < csr.start_time THEN 'not_started'
-                         WHEN CURRENT_TIMESTAMP <= csr.end_time THEN 'open'
-                         ELSE 'ended'
-                       END AS status,
                        term.academic_year, term.semester
                 FROM course_selection_round csr
                 JOIN term ON term.term_id = csr.term_id
-                ORDER BY CASE
-                           WHEN csr.status = 'closed' THEN 2
-                           WHEN CURRENT_TIMESTAMP BETWEEN csr.start_time AND csr.end_time THEN 0
-                           WHEN CURRENT_TIMESTAMP < csr.start_time THEN 1
-                           ELSE 3
-                         END, csr.start_time DESC, csr.round_id DESC
-                """, Map.of()));
-        result.put("statusDistribution", jdbc.queryForList("""
-                SELECT status, COUNT(*) AS count
-                FROM student_course_selection
-                GROUP BY status
-                UNION ALL
-                SELECT 'waiting' AS status, COUNT(*) AS count
-                FROM selection_waitlist
-                WHERE status = 'waiting'
-                UNION ALL
-                SELECT 'failed' AS status, COUNT(*) AS count
-                FROM selection_request_log
-                WHERE request_status IN ('failed', 'fail', 'error')
-                """, Map.of()));
+                WHERE csr.status <> 'closed'
+                  AND CURRENT_TIMESTAMP BETWEEN csr.start_time AND csr.end_time
+                ORDER BY csr.start_time DESC, csr.round_id DESC
+                LIMIT 1
+                """, Map.of());
+
+        if (currentRounds.isEmpty()) {
+            result.put("round", null);
+            result.put("classes", List.of());
+            return ApiResponse.ok(result);
+        }
+
+        Map<String, Object> currentRound = currentRounds.get(0);
+        result.put("round", currentRound);
         result.put("classes", jdbc.queryForList("""
                 SELECT tc.teaching_class_id,
                        tc.class_code,
                        tc.class_name,
+                       tc.course_id,
                        tc.term_id,
                        tc.capacity,
-                       tc.selected_count,
-                       GREATEST(tc.capacity - tc.selected_count, 0) AS remaining_count,
-                       tc.waitlist_count,
-                       GREATEST(tc.capacity - tc.selected_count, 0) AS redis_remaining,
+                       COALESCE(selection_stats.selected_count, 0) AS selected_count,
+                       GREATEST(tc.capacity - COALESCE(selection_stats.selected_count, 0), 0) AS remaining_count,
+                       COALESCE(waitlist_stats.waitlist_count, 0) AS waitlist_count,
                        tc.status,
                        c.course_code,
                        c.course_name,
+                       c.credit,
+                       c.hours,
                        t.teacher_name,
                        term.academic_year,
-                       term.semester
+                       term.semester,
+                       CASE
+                         WHEN :capacityKeyword = '' THEN 1
+                         WHEN LOWER(c.course_name) LIKE :capacityLike THEN 1
+                         WHEN EXISTS (
+                           SELECT 1
+                           FROM student_course_selection search_scs
+                           JOIN student search_student ON search_student.student_id = search_scs.student_id
+                           WHERE search_scs.teaching_class_id = tc.teaching_class_id
+                             AND LOWER(search_student.student_no) LIKE :capacityLike
+                         ) THEN 1
+                         ELSE 0
+                       END AS capacity_match,
+                       CASE
+                         WHEN :waitlistKeyword = '' THEN 1
+                         WHEN LOWER(c.course_name) LIKE :waitlistLike THEN 1
+                         WHEN EXISTS (
+                           SELECT 1
+                           FROM selection_waitlist search_waitlist
+                           JOIN student waitlist_student ON waitlist_student.student_id = search_waitlist.student_id
+                           WHERE search_waitlist.teaching_class_id = tc.teaching_class_id
+                             AND search_waitlist.round_id = :roundId
+                             AND search_waitlist.status = 'waiting'
+                             AND LOWER(waitlist_student.student_no) LIKE :waitlistLike
+                         ) THEN 1
+                         ELSE 0
+                       END AS waitlist_match
                 FROM teaching_class tc
                 JOIN course c ON c.course_id = tc.course_id
                 JOIN teacher t ON t.teacher_id = tc.teacher_id
                 JOIN term ON term.term_id = tc.term_id
-                ORDER BY tc.waitlist_count DESC, tc.selected_count DESC, tc.teaching_class_id DESC
-                """, Map.of()));
-        result.put("hotClasses", jdbc.queryForList("""
-                SELECT tc.teaching_class_id, tc.class_code, c.course_name, t.teacher_name, tc.selected_count
-                FROM teaching_class tc
-                JOIN course c ON c.course_id = tc.course_id
-                JOIN teacher t ON t.teacher_id = tc.teacher_id
-                ORDER BY tc.selected_count DESC, tc.teaching_class_id DESC
-                LIMIT 10
-                """, Map.of()));
-        result.put("waitlistTop", jdbc.queryForList("""
-                SELECT tc.teaching_class_id, tc.class_code, c.course_name, t.teacher_name, tc.waitlist_count
-                FROM teaching_class tc
-                JOIN course c ON c.course_id = tc.course_id
-                JOIN teacher t ON t.teacher_id = tc.teacher_id
-                ORDER BY tc.waitlist_count DESC, tc.teaching_class_id DESC
-                LIMIT 10
-                """, Map.of()));
+                LEFT JOIN (
+                  SELECT teaching_class_id, COUNT(*) AS selected_count
+                  FROM student_course_selection
+                  WHERE status IN ('processing', 'selected')
+                  GROUP BY teaching_class_id
+                ) selection_stats ON selection_stats.teaching_class_id = tc.teaching_class_id
+                LEFT JOIN (
+                  SELECT teaching_class_id, COUNT(*) AS waitlist_count
+                  FROM selection_waitlist
+                  WHERE round_id = :roundId AND status = 'waiting'
+                  GROUP BY teaching_class_id
+                ) waitlist_stats ON waitlist_stats.teaching_class_id = tc.teaching_class_id
+                WHERE tc.term_id = :termId
+                ORDER BY c.course_code, tc.class_code, tc.teaching_class_id
+                """, new MapSqlParameterSource()
+                .addValue("roundId", currentRound.get("round_id"))
+                .addValue("termId", currentRound.get("term_id"))
+                .addValue("capacityKeyword", normalizedKeyword(capacityKeyword))
+                .addValue("capacityLike", likeKeyword(capacityKeyword))
+                .addValue("waitlistKeyword", normalizedKeyword(waitlistKeyword))
+                .addValue("waitlistLike", likeKeyword(waitlistKeyword))));
         return ApiResponse.ok(result);
     }
 
@@ -138,21 +152,20 @@ public class SelectionMonitorController {
                 FROM selection_waitlist sw
                 JOIN student s ON s.student_id = sw.student_id
                 LEFT JOIN admin_class ac ON ac.admin_class_id = s.admin_class_id
+                JOIN course_selection_round csr ON csr.round_id = sw.round_id
                 WHERE sw.teaching_class_id = :classId
+                  AND sw.status = 'waiting'
+                  AND csr.status <> 'closed'
+                  AND CURRENT_TIMESTAMP BETWEEN csr.start_time AND csr.end_time
                 ORDER BY sw.queue_no ASC, sw.waited_at ASC
                 """, new MapSqlParameterSource("classId", classId)));
     }
 
-    @GetMapping("/classes/{classId}/logs")
-    public ApiResponse<List<Map<String, Object>>> logs(@PathVariable Long classId) {
-        return ApiResponse.ok(jdbc.queryForList("""
-                SELECT srl.*,
-                       s.student_no,
-                       s.student_name
-                FROM selection_request_log srl
-                LEFT JOIN student s ON s.student_id = srl.student_id
-                WHERE srl.teaching_class_id = :classId
-                ORDER BY srl.request_id DESC
-                """, new MapSqlParameterSource("classId", classId)));
+    private String normalizedKeyword(String keyword) {
+        return keyword == null ? "" : keyword.trim().toLowerCase();
+    }
+
+    private String likeKeyword(String keyword) {
+        return "%" + normalizedKeyword(keyword) + "%";
     }
 }

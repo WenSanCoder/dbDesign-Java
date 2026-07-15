@@ -1,6 +1,7 @@
 package com.zjut.edusystem.student;
 
 import com.zjut.edusystem.common.BusinessException;
+import com.zjut.edusystem.selection.MajorCourseCacheService;
 import com.zjut.edusystem.selection.SelectionQueueService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -28,31 +29,29 @@ public class StudentSelectionService {
     private static final Logger log = LoggerFactory.getLogger(StudentSelectionService.class);
     private static final String ELECTIVE_SQL =
             "'general_elective', 'discipline_elective', 'major_elective'";
-    private static final String AVAILABLE_CACHE_KEY_PREFIX = "selection:available:v1";
     private static final String OPEN_ROUND_CACHE_KEY = "selection:open-round:v1";
-    private static final String AVAILABLE_VERSION_KEY_PREFIX = "selection:available:version:v1";
 
     private final NamedParameterJdbcTemplate jdbc;
     private final SelectionQueueService queueService;
+    private final MajorCourseCacheService majorCourseCacheService;
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
     private final boolean availableCacheEnabled;
-    private final Duration availableCacheTtl;
     private final Duration openRoundCacheTtl;
 
     public StudentSelectionService(NamedParameterJdbcTemplate jdbc,
                                    SelectionQueueService queueService,
+                                   MajorCourseCacheService majorCourseCacheService,
                                    StringRedisTemplate redisTemplate,
                                    ObjectMapper objectMapper,
                                    @Value("${edu-system.selection.available-cache.enabled:true}") boolean availableCacheEnabled,
-                                   @Value("${edu-system.selection.available-cache.ttl-seconds:30}") long availableCacheTtlSeconds,
                                    @Value("${edu-system.selection.round-ttl-seconds:5}") long openRoundCacheTtlSeconds) {
         this.jdbc = jdbc;
         this.queueService = queueService;
+        this.majorCourseCacheService = majorCourseCacheService;
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
         this.availableCacheEnabled = availableCacheEnabled;
-        this.availableCacheTtl = Duration.ofSeconds(Math.max(1L, availableCacheTtlSeconds));
         this.openRoundCacheTtl = Duration.ofSeconds(Math.max(1L, openRoundCacheTtlSeconds));
     }
 
@@ -61,125 +60,10 @@ public class StudentSelectionService {
         if (round == null) {
             return List.of();
         }
-        String cacheKey = availableCoursesCacheKey(studentId, round);
-        if (availableCacheEnabled) {
-            List<Map<String, Object>> cached = readAvailableCoursesCache(cacheKey);
-            if (cached != null) {
-                return cached;
-            }
-        }
-
-        MapSqlParameterSource params = new MapSqlParameterSource("studentId", studentId)
-                .addValue("termId", ((Number) round.get("term_id")).longValue())
-                .addValue("roundId", ((Number) round.get("round_id")).longValue())
-                .addValue("roundName", round.get("round_name"))
-                .addValue("academicYear", round.get("academic_year"))
-                .addValue("semester", ((Number) round.get("semester")).intValue());
-        List<Map<String, Object>> rows = jdbc.queryForList("""
-                SELECT
-                    c.course_id,
-                    c.course_code,
-                    c.course_name,
-                    c.credit,
-                    c.hours,
-                    tp.course_nature AS course_type,
-                    :roundId AS round_id,
-                    :roundName AS round_name,
-                    term.academic_year,
-                    term.semester,
-                    tc.teaching_class_id,
-                    tc.class_code,
-                    tc.class_name,
-                    tc.capacity,
-                    tc.selected_count,
-                    tc.waitlist_count,
-                    tc.status AS teaching_class_status,
-                    t.teacher_name,
-                    rule.lr_max_courses_per_term13 AS selection_max_courses_per_term,
-                    (
-                        SELECT COUNT(DISTINCT selected_course_tc.course_id)
-                        FROM student_course_selection selected_course_scs
-                        JOIN teaching_class selected_course_tc ON selected_course_tc.teaching_class_id = selected_course_scs.teaching_class_id
-                        WHERE selected_course_scs.student_id = s.student_id
-                          AND selected_course_scs.status IN ('processing', 'selected')
-                          AND selected_course_tc.term_id = tc.term_id
-                    ) AS selected_course_count,
-                    CASE WHEN rule.lr_max_courses_per_term13 IS NOT NULL
-                              AND (
-                                  SELECT COUNT(DISTINCT selected_course_tc.course_id)
-                                  FROM student_course_selection selected_course_scs
-                                  JOIN teaching_class selected_course_tc ON selected_course_tc.teaching_class_id = selected_course_scs.teaching_class_id
-                                  WHERE selected_course_scs.student_id = s.student_id
-                                    AND selected_course_scs.status IN ('processing', 'selected')
-                                    AND selected_course_tc.term_id = tc.term_id
-                              ) >= rule.lr_max_courses_per_term13
-                         THEN TRUE ELSE FALSE END AS selection_limit_warning,
-                    cs.schedule_id,
-                    cs.weekday,
-                    cs.start_period,
-                    cs.end_period,
-                    cs.start_week,
-                    cs.end_week,
-                    cs.week_pattern,
-                    cs.classroom,
-                    cs.weeks,
-                    CASE WHEN tcac.admin_class_id IS NOT NULL THEN TRUE ELSE FALSE END AS default_class,
-                    scs.selection_id,
-                    scs.status AS selection_status,
-                    selected_same.teaching_class_id AS selected_course_teaching_class_id,
-                    selected_same.class_name AS selected_course_class_name,
-                    sw.status AS waitlist_status,
-                    CASE WHEN tc.capacity - tc.selected_count > 0 THEN tc.capacity - tc.selected_count ELSE 0 END AS remaining_count
-                FROM student s
-                JOIN (
-                    SELECT base_plan.course_id, base_plan.course_nature
-                    FROM student plan_student
-                    JOIN admin_class plan_class ON plan_class.admin_class_id = plan_student.admin_class_id
-                    JOIN teaching_plan base_plan
-                      ON base_plan.major_id = plan_class.major_id
-                     AND base_plan.grade_year = plan_student.grade_year
-                    JOIN term base_term ON base_term.term_id = base_plan.term_id
-                    WHERE plan_student.student_id = :studentId
-                      AND regexp_replace(base_term.academic_year, '[^0-9]', '', 'g') = regexp_replace(:academicYear, '[^0-9]', '', 'g')
-                      AND base_term.semester = :semester
-                      AND base_plan.course_nature IN ('general_elective', 'discipline_elective', 'major_elective')
-                    UNION
-                    SELECT adjustment.lr_course_id13, adjustment.lr_course_nature13
-                    FROM sht_student_plan_adjustments13 adjustment
-                    WHERE adjustment.lr_student_id13 = :studentId
-                      AND adjustment.lr_status13 = 'APPROVED'
-                      AND (adjustment.lr_target_term_id13 IS NULL OR adjustment.lr_target_term_id13 = :termId)
-                ) tp ON TRUE
-                JOIN course c ON c.course_id = tp.course_id
-                JOIN teaching_class tc ON tc.course_id = c.course_id AND tc.term_id = :termId
-                JOIN term term ON term.term_id = tc.term_id
-                JOIN teacher t ON t.teacher_id = tc.teacher_id
-                JOIN admin_class student_class ON student_class.admin_class_id = s.admin_class_id
-                LEFT JOIN sht_major_category_selection_rules13 rule
-                  ON rule.lr_major_id13 = student_class.major_id
-                 AND rule.lr_grade_year13 = s.grade_year
-                 AND rule.lr_category_code13 = tp.course_nature
-                LEFT JOIN class_schedule cs ON cs.teaching_class_id = tc.teaching_class_id
-                LEFT JOIN teaching_class_admin_class tcac ON tcac.teaching_class_id = tc.teaching_class_id AND tcac.admin_class_id = s.admin_class_id
-                LEFT JOIN student_course_selection scs ON scs.student_id = s.student_id
-                    AND scs.teaching_class_id = tc.teaching_class_id
-                    AND scs.status IN ('processing', 'selected')
-                LEFT JOIN (
-                    SELECT scs2.student_id, tc2.course_id, tc2.term_id, tc2.teaching_class_id, tc2.class_name
-                    FROM student_course_selection scs2
-                    JOIN teaching_class tc2 ON tc2.teaching_class_id = scs2.teaching_class_id
-                    WHERE scs2.status IN ('processing', 'selected')
-                ) selected_same ON selected_same.student_id = s.student_id AND selected_same.course_id = c.course_id AND selected_same.term_id = tc.term_id
-                LEFT JOIN selection_waitlist sw ON sw.student_id = s.student_id
-                    AND sw.teaching_class_id = tc.teaching_class_id
-                    AND sw.status = 'waiting'
-                WHERE s.student_id = :studentId
-                  AND tc.status = 'open'
-                ORDER BY c.course_code, tc.class_code, cs.weekday, cs.start_period
-                """, params);
-        List<Map<String, Object>> grouped = groupAvailableCourses(rows);
-        writeAvailableCoursesCache(cacheKey, grouped);
-        return grouped;
+        Long termId = ((Number) round.get("term_id")).longValue();
+        List<Map<String, Object>> rows = majorCourseCacheService.availableCourseRows(studentId, round);
+        enrichAvailableCourseRows(rows, studentId, termId);
+        return groupAvailableCourses(rows);
     }
 
     public List<Map<String, Object>> mySelections(Long studentId) {
@@ -441,10 +325,8 @@ public class StudentSelectionService {
                     WHERE teaching_class_id = :teachingClassId AND selected_count > 0
                     """, new MapSqlParameterSource("teachingClassId", teachingClassId));
             throw ex;
-        } finally {
-            evictAvailableCoursesCache(studentId, roundId);
-            bumpAvailableCoursesVersion(roundId);
         }
+        majorCourseCacheService.refreshTeachingClassStateAfterCommit(roundId, teachingClassId);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("requestId", requestId);
         result.put("selectionLimitWarning", Boolean.TRUE.equals(selectionLimit.get("warning")));
@@ -530,8 +412,7 @@ public class StudentSelectionService {
                 """, new MapSqlParameterSource("teachingClassId", teachingClassId));
         promoteWaitlist(teachingClassId);
         Long roundId = selection.get("round_id") == null ? null : ((Number) selection.get("round_id")).longValue();
-        evictAvailableCoursesCache(studentId, roundId);
-        bumpAvailableCoursesVersion(roundId);
+        majorCourseCacheService.refreshTeachingClassStateAfterCommit(roundId, teachingClassId);
     }
 
     @Transactional
@@ -561,8 +442,7 @@ public class StudentSelectionService {
                 .addValue("queueNo", queueNo));
         jdbc.update("UPDATE teaching_class SET waitlist_count = waitlist_count + 1 WHERE teaching_class_id = :id",
                 new MapSqlParameterSource("id", teachingClassId));
-        evictAvailableCoursesCache(studentId, roundId);
-        bumpAvailableCoursesVersion(roundId);
+        majorCourseCacheService.refreshTeachingClassStateAfterCommit(roundId, teachingClassId);
     }
 
     public List<Map<String, Object>> myWaitlist(Long studentId) {
@@ -575,6 +455,82 @@ public class StudentSelectionService {
                 WHERE sw.student_id = :studentId
                 ORDER BY sw.waited_at DESC
                 """, new MapSqlParameterSource("studentId", studentId));
+    }
+
+    private void enrichAvailableCourseRows(List<Map<String, Object>> rows, Long studentId, Long termId) {
+        if (rows.isEmpty()) {
+            return;
+        }
+        List<Long> teachingClassIds = rows.stream()
+                .map(row -> ((Number) row.get("teaching_class_id")).longValue())
+                .distinct()
+                .toList();
+        MapSqlParameterSource params = new MapSqlParameterSource("studentId", studentId)
+                .addValue("termId", termId)
+                .addValue("teachingClassIds", teachingClassIds);
+
+        List<Map<String, Object>> personalRows = jdbc.queryForList("""
+                SELECT tc.teaching_class_id,
+                       CASE WHEN tcac.admin_class_id IS NOT NULL THEN TRUE ELSE FALSE END AS default_class,
+                       scs.selection_id,
+                       scs.status AS selection_status,
+                       sw.status AS waitlist_status
+                FROM teaching_class tc
+                JOIN student s ON s.student_id = :studentId
+                LEFT JOIN teaching_class_admin_class tcac
+                       ON tcac.teaching_class_id = tc.teaching_class_id
+                      AND tcac.admin_class_id = s.admin_class_id
+                LEFT JOIN student_course_selection scs
+                       ON scs.student_id = s.student_id
+                      AND scs.teaching_class_id = tc.teaching_class_id
+                      AND scs.status IN ('processing', 'selected')
+                LEFT JOIN selection_waitlist sw
+                       ON sw.student_id = s.student_id
+                      AND sw.teaching_class_id = tc.teaching_class_id
+                      AND sw.status = 'waiting'
+                WHERE tc.teaching_class_id IN (:teachingClassIds)
+                """, params);
+        Map<Long, Map<String, Object>> personalByClass = new LinkedHashMap<>();
+        for (Map<String, Object> personalRow : personalRows) {
+            personalByClass.put(((Number) personalRow.get("teaching_class_id")).longValue(), personalRow);
+        }
+
+        List<Map<String, Object>> selectedRows = jdbc.queryForList("""
+                SELECT tc.course_id, tc.teaching_class_id, tc.class_name
+                FROM student_course_selection scs
+                JOIN teaching_class tc ON tc.teaching_class_id = scs.teaching_class_id
+                WHERE scs.student_id = :studentId
+                  AND scs.status IN ('processing', 'selected')
+                  AND tc.term_id = :termId
+                ORDER BY scs.selected_at DESC, scs.selection_id DESC
+                """, params);
+        Map<Long, Map<String, Object>> selectedByCourse = new LinkedHashMap<>();
+        for (Map<String, Object> selectedRow : selectedRows) {
+            selectedByCourse.putIfAbsent(
+                    ((Number) selectedRow.get("course_id")).longValue(), selectedRow);
+        }
+        int selectedCourseCount = selectedByCourse.size();
+
+        for (Map<String, Object> row : rows) {
+            Long teachingClassId = ((Number) row.get("teaching_class_id")).longValue();
+            Map<String, Object> personal = personalByClass.get(teachingClassId);
+            row.put("default_class", personal != null && Boolean.TRUE.equals(personal.get("default_class")));
+            row.put("selection_id", personal == null ? null : personal.get("selection_id"));
+            row.put("selection_status", personal == null ? null : personal.get("selection_status"));
+            row.put("waitlist_status", personal == null ? null : personal.get("waitlist_status"));
+
+            Long courseId = ((Number) row.get("course_id")).longValue();
+            Map<String, Object> selected = selectedByCourse.get(courseId);
+            row.put("selected_course_teaching_class_id",
+                    selected == null ? null : selected.get("teaching_class_id"));
+            row.put("selected_course_class_name", selected == null ? null : selected.get("class_name"));
+            row.put("selected_course_count", selectedCourseCount);
+
+            Object maxCoursesValue = row.get("selection_max_courses_per_term");
+            boolean limitWarning = maxCoursesValue instanceof Number maxCourses
+                    && selectedCourseCount >= maxCourses.intValue();
+            row.put("selection_limit_warning", limitWarning);
+        }
     }
 
     private List<Map<String, Object>> groupAvailableCourses(List<Map<String, Object>> rows) {
@@ -722,81 +678,6 @@ public class StudentSelectionService {
             log.debug("Unable to write the open-round cache", ex);
         }
         return compact;
-    }
-
-    private String availableCoursesCacheKey(Long studentId, Map<String, Object> round) {
-        Long roundId = ((Number) round.get("round_id")).longValue();
-        return AVAILABLE_CACHE_KEY_PREFIX + ":student:" + studentId
-                + ":round:" + roundId + ":v:" + availableCoursesVersion(roundId);
-    }
-
-    private String availableCoursesVersion(Long roundId) {
-        if (!availableCacheEnabled || roundId == null) {
-            return "0";
-        }
-        try {
-            String version = redisTemplate.opsForValue().get(availableCoursesVersionKey(roundId));
-            return StringUtils.hasText(version) ? version : "0";
-        } catch (Exception ex) {
-            log.debug("Unable to read the available-course cache version", ex);
-            return "0";
-        }
-    }
-
-    private String availableCoursesVersionKey(Long roundId) {
-        return AVAILABLE_VERSION_KEY_PREFIX + ":round:" + roundId;
-    }
-
-    private List<Map<String, Object>> readAvailableCoursesCache(String cacheKey) {
-        if (!availableCacheEnabled) {
-            return null;
-        }
-        try {
-            String cached = redisTemplate.opsForValue().get(cacheKey);
-            if (!StringUtils.hasText(cached)) {
-                return null;
-            }
-            return objectMapper.readValue(cached, new TypeReference<List<Map<String, Object>>>() { });
-        } catch (Exception ex) {
-            log.debug("Unable to read available-course cache key {}", cacheKey, ex);
-            return null;
-        }
-    }
-
-    private void writeAvailableCoursesCache(String cacheKey, List<Map<String, Object>> courses) {
-        if (!availableCacheEnabled) {
-            return;
-        }
-        try {
-            redisTemplate.opsForValue().set(
-                    cacheKey, objectMapper.writeValueAsString(courses), availableCacheTtl);
-        } catch (Exception ex) {
-            log.debug("Unable to write available-course cache key {}", cacheKey, ex);
-        }
-    }
-
-    private void evictAvailableCoursesCache(Long studentId, Long roundId) {
-        if (!availableCacheEnabled || studentId == null || roundId == null) {
-            return;
-        }
-        try {
-            String key = AVAILABLE_CACHE_KEY_PREFIX + ":student:" + studentId
-                    + ":round:" + roundId + ":v:" + availableCoursesVersion(roundId);
-            redisTemplate.delete(key);
-        } catch (Exception ex) {
-            log.debug("Unable to evict available-course cache for student {}", studentId, ex);
-        }
-    }
-
-    private void bumpAvailableCoursesVersion(Long roundId) {
-        if (!availableCacheEnabled || roundId == null) {
-            return;
-        }
-        try {
-            redisTemplate.opsForValue().increment(availableCoursesVersionKey(roundId));
-        } catch (Exception ex) {
-            log.debug("Unable to increment available-course cache version for round {}", roundId, ex);
-        }
     }
 
     private Map<String, Object> validateRound(Long roundId) {

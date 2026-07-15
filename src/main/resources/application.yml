@@ -16,9 +16,9 @@ spring:
       minimum-idle: 2
   data:
     redis:
-      host: ${REDIS_HOST:localhost}
-      port: ${REDIS_PORT:6379}
-      password: ${REDIS_PASSWORD:}
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6380}
+      password: "${REDIS_PASSWORD:@Sht20051229}"
       database: ${REDIS_DATABASE:0}
       timeout: ${REDIS_TIMEOUT:2s}
   jackson:
@@ -30,6 +30,18 @@ mybatis-plus:
     map-underscore-to-camel-case: true
 
 edu-system:
+  redis:
+    ssh:
+      enabled: ${REDIS_SSH_ENABLED:true}
+      host: ${REDIS_SSH_HOST:111.228.45.195}
+      port: ${REDIS_SSH_PORT:22}
+      username: ${REDIS_SSH_USERNAME:root}
+      password: "${REDIS_SSH_PASSWORD:@Sht20051229}"
+      local-host: ${REDIS_SSH_LOCAL_HOST:127.0.0.1}
+      local-port: ${REDIS_SSH_LOCAL_PORT:6380}
+      remote-host: ${REDIS_SSH_REMOTE_HOST:127.0.0.1}
+      remote-port: ${REDIS_SSH_REMOTE_PORT:6379}
+      connect-timeout-ms: ${REDIS_SSH_CONNECT_TIMEOUT_MS:10000}
   upload:
     image-dir: ${IMAGE_UPLOAD_DIR:uploads/image}
     public-base-url: ${PUBLIC_BASE_URL:http://x6.sjcmc.cn:34084}
@@ -45,5 +57,8 @@ edu-system:
   selection:
     available-cache:
       enabled: ${SELECTION_AVAILABLE_CACHE_ENABLED:true}
-      ttl-seconds: ${SELECTION_AVAILABLE_CACHE_TTL_SECONDS:30}
+      preheat-minutes: ${SELECTION_AVAILABLE_CACHE_PREHEAT_MINUTES:5}
+      scan-interval-ms: ${SELECTION_AVAILABLE_CACHE_SCAN_INTERVAL_MS:15000}
+      initial-delay-ms: ${SELECTION_AVAILABLE_CACHE_INITIAL_DELAY_MS:5000}
+      catalog-ttl-seconds: ${SELECTION_AVAILABLE_CACHE_TTL_SECONDS:604800}
       round-ttl-seconds: ${SELECTION_ROUND_CACHE_TTL_SECONDS:5}
